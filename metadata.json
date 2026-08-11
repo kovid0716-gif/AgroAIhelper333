@@ -1,0 +1,11 @@
+{
+  "name": "AgroAI Helper",
+  "description": "AI-powered plant health assistant with multimodal diagnosis, disease identification, step-by-step treatment plans, and agronomic care guides.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
