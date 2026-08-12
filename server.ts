@@ -1,20 +1,22 @@
 import express from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Используем текущую рабочую директорию проекта, совместимую с esbuild/cjs на Render
+const __dirname = process.cwd();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '50mb' }));
 
-// Initialize Gemini Client
+// Раздача скомпилированных статических файлов React-приложения из папки dist
+app.use(express.static(path.join(__dirname, 'dist')));
+
+// Инициализация Gemini Client
 const getGeminiAI = () => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -30,12 +32,21 @@ const getGeminiAI = () => {
   });
 };
 
-// Hugging Face Token Helper
+// Хелпер для токена Hugging Face
 const getHFToken = () => {
   return process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN || process.env.HF_API_KEY || null;
 };
 
-// Hugging Face Analysis Handler
+// Инструкция для ИИ
+const SYSTEM_INSTRUCTION = `You are AgroAI Helper, an elite agricultural scientist, botanist, and plant pathologist AI. 
+Analyze the provided plant photo or textual description with expert precision.
+Identify plant species, diagnose diseases, pest infestations, nutrient deficiencies, watering or environmental stress, or confirm if the plant is completely healthy.
+
+Provide a comprehensive, highly actionable diagnostic output in valid JSON format.
+Ensure treatment steps are immediate and organic or eco-friendly where possible.
+Provide accurate recommended product categories and realistic care schedules.`;
+
+// Вспомогательная функция анализа через резервный Hugging Face
 async function callHuggingFaceAnalysis(prompt?: string, imageBase64?: string, language: string = 'en') {
   const token = getHFToken();
   if (!token) return null;
@@ -104,14 +115,6 @@ Output strictly valid JSON object with keys: plantName, botanicalName, diseaseNa
   return null;
 }
 
-const SYSTEM_INSTRUCTION = `You are AgroAI Helper, an elite agricultural scientist, botanist, and plant pathologist AI. 
-Analyze the provided plant photo or textual description with expert precision.
-Identify plant species, diagnose diseases, pest infestations, nutrient deficiencies, watering or environmental stress, or confirm if the plant is completely healthy.
-
-Provide a comprehensive, highly actionable diagnostic output in valid JSON format.
-Ensure treatment steps are immediate and organic or eco-friendly where possible.
-Provide accurate recommended product categories and realistic care schedules.`;
-
 const RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
@@ -122,21 +125,9 @@ const RESPONSE_SCHEMA = {
     confidence: { type: Type.INTEGER, description: 'Confidence percentage between 80 and 99' },
     severity: { type: Type.STRING, description: 'One of: Healthy, Low, Moderate, High, Critical' },
     summary: { type: Type.STRING, description: '2-3 sentence executive diagnosis summary' },
-    symptoms: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description: 'List of observed physical symptoms'
-    },
-    treatmentSteps: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description: 'Step-by-step immediate action plan'
-    },
-    preventativeTips: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description: 'Long term care and preventative guidelines'
-    },
+    symptoms: { type: Type.ARRAY, items: { type: Type.STRING } },
+    treatmentSteps: { type: Type.ARRAY, items: { type: Type.STRING } },
+    preventativeTips: { type: Type.ARRAY, items: { type: Type.STRING } },
     recommendedProducts: {
       type: Type.ARRAY,
       items: {
@@ -144,7 +135,7 @@ const RESPONSE_SCHEMA = {
         properties: {
           id: { type: Type.STRING },
           name: { type: Type.STRING },
-          category: { type: Type.STRING, description: 'Fungicide, Insecticide, Fertilizer, Soil, Tool, or Organic' },
+          category: { type: Type.STRING },
           description: { type: Type.STRING },
           priceEstimate: { type: Type.STRING },
           rating: { type: Type.NUMBER }
@@ -182,383 +173,84 @@ const RESPONSE_SCHEMA = {
   ]
 };
 
-// API Endpoint for Plant Analysis
+// Главный API-эндпоинт анализа
 app.post('/api/analyze', async (req, res) => {
   try {
-    const { prompt, imageBase64, mimeType = 'image/jpeg', modelId, language = 'en' } = req.body;
-
+    const { prompt, imageBase64, mimeType = 'image/jpeg', language = 'en' } = req.body;
     const ai = getGeminiAI();
-
-    // Model selection
-    const selectedModel = 'gemini-3.6-flash';
 
     const langNameMap: Record<string, string> = {
       en: 'English',
-      ru: 'Russian (Русский)',
-      kk: 'Kazakh (Қазақша)',
+      ru: 'Russian',
+      kk: 'Kazakh'
     };
     const targetLangName = langNameMap[language] || 'English';
 
     const dynamicSystemInstruction = `${SYSTEM_INSTRUCTION}
+CRITICAL LANGUAGE REQUIREMENT: All text content in the output JSON MUST BE WRITTEN IN ${targetLangName.toUpperCase()}.`;
 
-CRITICAL LANGUAGE REQUIREMENT: All text content in the output JSON (plantName, diseaseName, summary, symptoms, treatmentSteps, preventativeTips, recommendedProducts descriptions and names, careGuide values, weatherNotes) MUST BE WRITTEN IN ${targetLangName.toUpperCase()}.`;
-
+    // Если основной Gemini API доступен
     if (ai) {
       try {
-        const parts: any[] = [];
+        const contents: any[] = [];
 
         if (imageBase64) {
-          // Strip data URI header if present
           const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
-          parts.push({
+          contents.push({
             inlineData: {
-              mimeType: mimeType || 'image/jpeg',
-              data: cleanBase64
+              data: cleanBase64,
+              mimeType: mimeType
             }
           });
         }
 
-        const userPromptText = prompt || 'Analyze this plant photo for health status, diseases, pests, watering needs, and treatment recommendations.';
-        parts.push({ text: `${userPromptText} (Please respond in ${targetLangName})` });
+        contents.push({
+          text: prompt || 'Analyze this plant status and provide expert diagnostics.'
+        });
 
         const response = await ai.models.generateContent({
-          model: selectedModel,
-          contents: { parts },
+          model: 'gemini-3.6-flash',
+          contents: contents,
           config: {
             systemInstruction: dynamicSystemInstruction,
+            temperature: 0.2,
             responseMimeType: 'application/json',
-            responseSchema: RESPONSE_SCHEMA,
-            temperature: 0.2
+            responseSchema: RESPONSE_SCHEMA
           }
         });
 
-        const text = response.text;
-        if (text) {
-          const parsed = JSON.parse(text);
+        const textResponse = response.text;
+        if (textResponse) {
+          const parsed = JSON.parse(textResponse);
           parsed.id = 'diag-' + Date.now();
           parsed.timestamp = 'Just now';
           parsed.imageUrl = imageBase64 || undefined;
-          return res.json({ success: true, diagnosis: parsed });
+          return res.json(parsed);
         }
       } catch (geminiError: any) {
-        console.warn('Gemini API call failed, trying Hugging Face if configured...', geminiError?.message || geminiError);
+        console.warn('Gemini API failed, switching to Hugging Face fallback...', geminiError?.message || geminiError);
       }
     }
 
-    // Try Hugging Face if HF_TOKEN is configured
-    if (getHFToken()) {
-      console.log('Attempting analysis via Hugging Face Inference API...');
-      const hfDiagnosis = await callHuggingFaceAnalysis(prompt, imageBase64, language);
-      if (hfDiagnosis) {
-        return res.json({ success: true, diagnosis: hfDiagnosis, note: 'Generated via Hugging Face AI' });
-      }
+    // Если Gemini отключен или упал — вызываем Hugging Face
+    const hfFallbackData = await callHuggingFaceAnalysis(prompt, imageBase64, language);
+    if (hfFallbackData) {
+      return res.json(hfFallbackData);
     }
 
-    // Fallback logic if no API key is present or responses fail
-    console.log('Generating agronomy analysis response (Fallback mode)...');
-    const fallbackDiagnosis = generateFallbackDiagnosis(prompt, imageBase64, language);
-    return res.json({ success: true, diagnosis: fallbackDiagnosis });
+    throw new Error('All AI service endpoints failed or are unconfigured.');
 
   } catch (error: any) {
-    console.error('Error in /api/analyze:', error?.message || error);
-
-    // Try Hugging Face as last resort
-    if (getHFToken()) {
-      try {
-        const hfDiagnosis = await callHuggingFaceAnalysis(req.body?.prompt, req.body?.imageBase64, req.body?.language);
-        if (hfDiagnosis) {
-          return res.json({ success: true, diagnosis: hfDiagnosis, note: 'Generated via Hugging Face AI' });
-        }
-      } catch (hfErr) {
-        console.error('Hugging Face fallback error:', hfErr);
-      }
-    }
-
-    // Graceful fallback response on error
-    const fallbackDiagnosis = generateFallbackDiagnosis(req.body?.prompt, req.body?.imageBase64, req.body?.language);
-    return res.json({ success: true, diagnosis: fallbackDiagnosis, note: 'Generated via AgroAI Agronomy Engine' });
+    console.error('Analysis endpoint failure:', error);
+    res.status(500).json({ error: error?.message || 'Internal Server Error' });
   }
 });
 
-// General Chat / Question API
-app.post('/api/chat', async (req, res) => {
-  try {
-    const { message, history } = req.body;
-    const ai = getGeminiAI();
-
-    if (ai) {
-      try {
-        const response = await ai.models.generateContent({
-          model: 'gemini-3.6-flash',
-          contents: message,
-          config: {
-            systemInstruction: 'You are AgroAI Helper, a helpful, encouraging, and highly knowledgeable plant health assistant. Provide concise, friendly, and practical plant care advice.',
-          }
-        });
-
-        if (response.text) {
-          return res.json({ success: true, reply: response.text });
-        }
-      } catch (gemErr: any) {
-        console.warn('Gemini chat failed, trying Hugging Face...', gemErr?.message || gemErr);
-      }
-    }
-
-    // Try Hugging Face Chat
-    if (getHFToken()) {
-      try {
-        const hfRes = await fetch('https://router.huggingface.co/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${getHFToken()}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            model: 'Qwen/Qwen2.5-72B-Instruct',
-            messages: [
-              { role: 'system', content: 'You are AgroAI Helper, a helpful, encouraging, and highly knowledgeable plant health assistant. Provide concise, friendly, and practical plant care advice.' },
-              { role: 'user', content: message }
-            ],
-            max_tokens: 1024,
-            temperature: 0.7
-          })
-        });
-
-        if (hfRes.ok) {
-          const hfData = await hfRes.json();
-          const replyText = hfData.choices?.[0]?.message?.content;
-          if (replyText) {
-            return res.json({ success: true, reply: replyText });
-          }
-        }
-      } catch (hfChatErr) {
-        console.error('Hugging Face chat failed:', hfChatErr);
-      }
-    }
-
-    return res.json({
-      success: true,
-      reply: `I recommend inspecting soil moisture 2 inches down and checking undersides of leaves for spider mites or aphids. Ensure adequate drainage and indirect light.`
-    });
-  } catch (err: any) {
-    return res.json({
-      success: true,
-      reply: `For optimal plant health, maintain temperature between 18-26°C, avoid overwatering, and ensure roots receive sufficient oxygen through aerated soil.`
-    });
-  }
+// Перенаправление всех остальных GET-запросов на индексную страницу Single Page Application
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
-function generateFallbackDiagnosis(prompt?: string, imageBase64?: string, language: string = 'en') {
-  const isTomato = prompt?.toLowerCase().includes('tomato') || prompt?.toLowerCase().includes('blight');
-  const isSucculent = prompt?.toLowerCase().includes('succulent') || prompt?.toLowerCase().includes('rot') || prompt?.toLowerCase().includes('cactus');
-  const isMonstera = prompt?.toLowerCase().includes('monstera') || prompt?.toLowerCase().includes('yellow');
-
-  if (isTomato) {
-    return {
-      id: 'diag-' + Date.now(),
-      plantName: 'Tomato',
-      botanicalName: 'Solanum lycopersicum',
-      diseaseName: 'Early Blight (Alternaria solani)',
-      isHealthy: false,
-      confidence: 95,
-      severity: 'High',
-      summary: 'Classic signs of Early Blight identified. Fungal spore colonies present as yellow halo concentric ring spots on lower older foliage.',
-      symptoms: [
-        'Concentric ring target spots on mature lower leaves',
-        'Yellowing margins spreading outward from leaf lesions',
-        'Premature dropping of lower foliage'
-      ],
-      treatmentSteps: [
-        'Prune all affected lower branches up to 12 inches off soil.',
-        'Apply liquid copper fungicide spray evenly across remaining foliage.',
-        'Mulch base of stem with straw to prevent soil-splash pathogen transfer.',
-        'Avoid overhead spraying; irrigate strictly at soil level.'
-      ],
-      preventativeTips: [
-        'Ensure 24-inch spacing between tomato vines for air circulation.',
-        'Rotate tomato and nightshade crops every 3 seasons.'
-      ],
-      recommendedProducts: [
-        {
-          id: 'p-fb1',
-          name: 'Bio-Copper Fungicide Concentrate',
-          category: 'Fungicide',
-          description: 'OMRI Listed organic liquid fungicide spray for blight and rust.',
-          priceEstimate: '$15.99',
-          rating: 4.9
-        },
-        {
-          id: 'p-fb2',
-          name: 'Pine Bark Soil Mulch Layer',
-          category: 'Soil',
-          description: 'Natural moisture barrier preventing fungal splashback.',
-          priceEstimate: '$8.49',
-          rating: 4.7
-        }
-      ],
-      careGuide: {
-        wateringSchedule: 'Deep irrigation every 2 days at soil level',
-        humidityLevel: '45% - 55% (Keep leaves dry)',
-        lightRequirement: 'Full direct sunlight (8+ hours/day)',
-        fertilizerNPK: 'NPK 5-10-10 high potassium organic fertilizer',
-        idealTemperature: '20°C - 28°C (68°F - 82°F)',
-        soilType: 'Rich, well-draining loamy soil with pH 6.2 - 6.8'
-      },
-      weatherNotes: {
-        condition: 'Humid Ambient Air',
-        tempImpact: 'Warm temperatures accelerate fungal spore division.',
-        humidityWarning: 'High humidity post-rain promotes leaf dampness.',
-        actionRequired: 'Apply preventative copper spray after rainfall dries.'
-      },
-      imageUrl: imageBase64,
-      timestamp: 'Just now'
-    };
-  }
-
-  if (isSucculent) {
-    return {
-      id: 'diag-' + Date.now(),
-      plantName: 'Echeveria Succulent',
-      botanicalName: 'Echeveria elegans',
-      diseaseName: 'Sub-surface Root Rot & Overwatering Stress',
-      isHealthy: false,
-      confidence: 93,
-      severity: 'High',
-      summary: 'Cellular collapse observed in lower leaves due to over-saturated soil mix preventing root respiration.',
-      symptoms: [
-        'Translucent, mushy lower leaf rosette petals',
-        'Soil mix remaining damp longer than 7 days',
-        'Soft stem base near lower root node'
-      ],
-      treatmentSteps: [
-        'Unpot succulent immediately and gently shake off soggy soil.',
-        'Inspect roots; clip away dark or mushy roots with sanitized shears.',
-        'Allow plant to dry in shade for 48 hours to callus over root cuts.',
-        'Repot in dry gritty cactus mix with 50% pumice/perlite.'
-      ],
-      preventativeTips: [
-        'Use terracotta pots with ample bottom drain holes.',
-        'Water using the soak-and-dry method only when soil is 100% bone dry.'
-      ],
-      recommendedProducts: [
-        {
-          id: 'p-fb3',
-          name: 'Gritty Succulent & Cactus Pumice Mix',
-          category: 'Soil',
-          description: '70% inorganic mineral pumice blend for rapid drainage.',
-          priceEstimate: '$12.50',
-          rating: 4.9
-        },
-        {
-          id: 'p-fb4',
-          name: 'Breathable Terracotta Planter Pot',
-          category: 'Tool',
-          description: 'Porous clay pot promoting rapid root aeration.',
-          priceEstimate: '$9.99',
-          rating: 4.8
-        }
-      ],
-      careGuide: {
-        wateringSchedule: 'Every 14-21 days when soil is completely dry',
-        humidityLevel: '30% - 45% (Low humidity preferred)',
-        lightRequirement: 'Bright direct to high indirect sun (6+ hours/day)',
-        fertilizerNPK: 'NPK 2-7-7 succulent booster once in spring',
-        idealTemperature: '18°C - 29°C (65°F - 85°F)',
-        soilType: 'Ultra-fast draining pumice, coarse sand & peat mix'
-      },
-      weatherNotes: {
-        condition: 'Cool Dry Interior',
-        tempImpact: 'Transpiration rate drops in cooler shade.',
-        humidityWarning: 'High humidity reduces moisture evaporation.',
-        actionRequired: 'Withhold all watering until potting media dries completely.'
-      },
-      imageUrl: imageBase64,
-      timestamp: 'Just now'
-    };
-  }
-
-  // Default Monstera / General Plant diagnosis
-  return {
-    id: 'diag-' + Date.now(),
-    plantName: prompt?.split(' ')?.[0] || 'Monstera Deliciosa',
-    botanicalName: 'Monstera deliciosa Liebm.',
-    diseaseName: 'Nutrient Deficiency & Moisture Imbalance',
-    isHealthy: false,
-    confidence: 96,
-    severity: 'Moderate',
-    summary: 'Analysis reveals slight nitrogen lockout accompanied by localized tip necrosis caused by tapwater mineral accumulation and low ambient humidity.',
-    symptoms: [
-      'Crispy brown leaf tips with yellow halo margins',
-      'Mild chlorosis on secondary foliage',
-      'Slight soil surface salt crusting'
-    ],
-    treatmentSteps: [
-      'Flush pot thoroughly with distilled or rainwater to remove excess salts.',
-      'Trim dry brown leaf margins with clean shears following natural leaf contour.',
-      'Feed with balanced water-soluble fertilizer at half recommended dosage.',
-      'Elevate ambient humidity using a room humidifier or moisture tray.'
-    ],
-    preventativeTips: [
-      'Use filtered or distilled water if tap water has high mineral content.',
-      'Maintain consistent watering routine without letting soil bone-dry or stay waterlogged.'
-    ],
-    recommendedProducts: [
-      {
-        id: 'p-fb5',
-        name: 'Organic Plant Bio-Nutrient Liquid Elixir',
-        category: 'Fertilizer',
-        description: 'Micro-nutrient seaweed & nitrogen formula for lush foliage.',
-        priceEstimate: '$13.99',
-        rating: 4.9
-      },
-      {
-        id: 'p-fb6',
-        name: 'Ultrasonic Cool Mist Plant Humidifier',
-        category: 'Tool',
-        description: 'Quiet 2.5L humidity generator with automatic humidistat.',
-        priceEstimate: '$24.99',
-        rating: 4.8
-      }
-    ],
-    careGuide: {
-      wateringSchedule: 'Every 7-10 days when top 2 inches dry out',
-      humidityLevel: '60% - 75% relative humidity',
-      lightRequirement: 'Bright indirect light (avoid direct burning noon sun)',
-      fertilizerNPK: 'NPK 3-1-2 liquid foliage boost monthly',
-      idealTemperature: '18°C - 27°C (65°F - 80°F)',
-      soilType: 'Chunky aroid soil mix with perlite, bark & peat'
-    },
-    weatherNotes: {
-      condition: 'Indoor Ambient Air',
-      tempImpact: 'Optimal range for active photosynthesis.',
-      humidityWarning: 'Air conditioning dry air can cause tip burn.',
-      actionRequired: 'Mist daily or group plants together to boost humidity micro-climate.'
-    },
-    imageUrl: imageBase64,
-    timestamp: 'Just now'
-  };
-}
-
-// Start Server or Vite Middleware
-async function start() {
-  if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`AgroAI Helper Server active on http://0.0.0.0:${PORT}`);
-  });
-}
-
-start();
+app.listen(PORT, () => {
+  console.log(`◇ AgroAI Helper Server active on port ${PORT}`);
+});
